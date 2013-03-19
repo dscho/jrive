@@ -10,6 +10,7 @@ import com.google.api.client.http.HttpTransport;
 import com.google.api.client.http.javanet.NetHttpTransport;
 import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.jackson2.JacksonFactory;
+import com.google.api.client.util.DateTime;
 import com.google.api.services.drive.Drive;
 import com.google.api.services.drive.Drive.Changes;
 import com.google.api.services.drive.Drive.Files;
@@ -21,12 +22,18 @@ import com.google.api.services.drive.model.ChangeList;
 import com.google.api.services.drive.model.File;
 import com.google.api.services.drive.model.Revision;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
+
+import org.scijava.util.ProcessUtils;
 
 public class CommandLine {
 
@@ -56,19 +63,31 @@ public class CommandLine {
 
 	public static void main(final String[] args) {
 		boolean force = false;
+		boolean showRevisions = false;
+		boolean fastExport = false;
+		String fastExportFrom = null;
+		int opt = 1;
 
 		int i;
 		for (i = 0; i < args.length && args[i].startsWith("-"); i++) {
 			final String arg = args[i];
 			if (arg.equals("-f") || arg.equals("--force")) {
 				force = true;
+			} else if (arg.equals("--revisions")) {
+				showRevisions = true;
+			} else if (arg.equals("--fast-export")) {
+				fastExport = true;
+				if (args.length == i + 3) {
+					fastExportFrom = args[i + 2];
+					opt++;
+				}
 			} else {
 				System.err.println("Unknown flag: " + arg);
 				System.exit(1);
 			}
 		}
 
-		if (args.length != i + 1) {
+		if (args.length != i + opt) {
 			System.err.println("Usage: " + CommandLine.class + " [-f] <id>");
 			System.exit(1);
 		}
@@ -82,7 +101,17 @@ public class CommandLine {
 			final Drive drive = new Drive.Builder(httpTransport, jsonFactory,
 					credential).setApplicationName(APPLICATION_NAME).build();
 
-			download(drive, gdocId, force);
+			if (showRevisions) {
+				showRevisions(drive, gdocId);
+			} else if (fastExport) {
+				final String outFileName = gdocId + ".export";
+				final OutputStream out = new FileOutputStream(outFileName);
+				gitFastExport(drive, gdocId, fastExportFrom, out);
+				out.close();
+				System.err.println("Exported to " + outFileName);
+			} else {
+				download(drive, gdocId, force);
+			}
 		} catch (final Exception e) {
 			e.printStackTrace();
 		}
@@ -96,7 +125,7 @@ public class CommandLine {
 		final String url = file2.getExportLinks().get(
 				"application/vnd.oasis.opendocument.text");
 
-		final String fileName = file2.getTitle().replace(" ", "") + ".odt";
+		final String fileName = getFileName(file2.getTitle());
 		final java.io.File file = new java.io.File(fileName);
 		if (!forceOverwrite && file.exists()) {
 			System.err.println("File " + file + " already exists; skipping");
@@ -104,10 +133,18 @@ public class CommandLine {
 		}
 		final OutputStream out = new FileOutputStream(file);
 		final MediaHttpDownloader downloader = get.getMediaHttpDownloader();
+		download(downloader, url, out);
+		System.err.println("\rDownloaded " + file.getAbsolutePath());
+	}
+
+	protected static void download(final MediaHttpDownloader downloader, final String url, final OutputStream out) throws Exception {
 		downloader.setProgressListener(getProgressListener());
 		downloader.download(new GenericUrl(url), out);
 		out.close();
-		System.err.println("\rDownloaded " + file.getAbsolutePath());
+	}
+
+	protected static String getFileName(final String originalFileName) {
+		return originalFileName.replace(" ", "") + ".odt";
 	}
 
 	protected static MediaHttpDownloaderProgressListener getProgressListener() {
@@ -125,10 +162,85 @@ public class CommandLine {
 	protected static void showRevisions(final Drive drive, final String gdocId)
 			throws Exception {
 		final Revisions revisions = drive.revisions();
+		final Revision revision1 = revisions.get(gdocId, "head").execute();
+		System.err.println("revision: " + revision1.getId() + "; " + revision1.getLastModifyingUserName() + " " + revision1.getModifiedDate());
 		for (final Revision revision : revisions.list(gdocId).execute()
 				.getItems()) {
-			System.err.println("revision: " + revision);
+			System.err.println("revision: " + revision.getId() + "; " + revision.getLastModifyingUserName() + " " + revision.getModifiedDate());
 		}
+	}
+
+	protected static void gitFastExport(final Drive drive, final String gdocId, String fromRevisionId, final OutputStream out) throws Exception {
+		final Revisions revisions = drive.revisions();
+		System.err.println("Getting head revision of " + gdocId);
+		final Revision head = revisions.get(gdocId, "head").execute();
+
+		Get get = drive.files().get(gdocId);
+		final String fileName = getFileName(get.execute().getTitle());
+
+		if ("from-git".equals(fromRevisionId)) {
+			final String commitSubject = git("log", "--format=%s", "-1", "--", fileName);
+			if (commitSubject.startsWith("Revision ")) {
+				fromRevisionId = commitSubject.substring(9);
+			} else {
+				fromRevisionId = null;
+			}
+		}
+
+		if (head.getId().equals(fromRevisionId)) return;
+
+		System.err.println("Getting revision list for " + fileName);
+		final Comparator<Revision> comparator = new Comparator<Revision>() {
+			//@Override
+			public int compare(final Revision a, final Revision b) {
+				long diff = a.getModifiedDate().getValue() - b.getModifiedDate().getValue();
+				return diff < 0 ? -1 : (diff > 0 ? 1 : 0);
+			}
+		};
+		final Set<Revision> toDownload = new TreeSet<Revision>(comparator);
+		long fromMillis = -1;
+		for (final Revision revision : revisions.list(gdocId).execute()
+				.getItems()) {
+			if (revision.getId().equals(fromRevisionId)) {
+				fromMillis = revision.getModifiedDate().getValue();
+			}
+			toDownload.add(revision);
+		}
+
+		int mark = 1;
+		for (final Revision revision : toDownload) {
+			if (revision.getModifiedDate().getValue() <= fromMillis) continue;
+
+			System.err.println("Downloading revision " + revision.getId() + " (" + mark + "/" + toDownload.size() + ")");
+			get = drive.files().get(gdocId);
+			final MediaHttpDownloader downloader = get.getMediaHttpDownloader();
+			Long fileSize = revision.getFileSize();
+			final ByteArrayOutputStream buffer = new ByteArrayOutputStream(fileSize == null ? 16384 : (int)fileSize.longValue());
+			download(downloader, revision.getExportLinks().get(
+				"application/vnd.oasis.opendocument.text"), buffer);
+			byte[] contents = buffer.toByteArray();
+			final String header = "blob\nmark :" + mark + "\ndata " + contents.length + "\n";
+			out.write(header.getBytes("UTF-8"));
+			out.write(contents);
+			final String author = revision.getLastModifyingUserName();
+			final DateTime date = revision.getModifiedDate();
+			final String dateString = formatTime(date.getValue(), date.getTimeZoneShift());
+			final String authorLine = "author " + (author == null ? "unknown <unknown" : author + " <" + author) + "@gmail.com> " + dateString;
+			final String committerLine = "committer Jrive <jrive@dscho.org> " + dateString;
+			final byte[] commitSubject = ("Revision " + revision.getId() + "\n").getBytes("UTF-8");
+			final byte[] commit = ("\ncommit refs/heads/master\n"
+					+ authorLine + "\n" + committerLine
+					+ "\ndata " + commitSubject.length + "\n").getBytes("UTF-8");
+			out.write(commit);
+			out.write(commitSubject);
+			final byte[] indexLine = ("M 100644 :" + mark++ + " " + fileName + "\n\n").getBytes("UTF-8");
+			out.write(indexLine);
+		}
+		out.flush();
+	}
+
+	protected static String formatTime(long millis, int tz) {
+		return String.format("%d %+05d", millis / 1000l, tz);
 	}
 
 	protected static void showChanges(final Drive drive) throws Exception {
@@ -159,5 +271,12 @@ public class CommandLine {
 							.getLastModifyingUserName()) + " modified "
 					+ (file == null ? "(null)" : file.getTitle()));
 		}
+	}
+
+	protected static String git(final String... args) {
+		final String[] commandLine = new String[args.length + 1];
+		commandLine[0] = "git";
+		System.arraycopy(args, 0, commandLine, 1, args.length);
+		return ProcessUtils.exec(null, System.err, null, commandLine);
 	}
 }
