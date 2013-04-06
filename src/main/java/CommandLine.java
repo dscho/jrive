@@ -29,6 +29,7 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -207,10 +208,20 @@ public class CommandLine {
 			toDownload.add(revision);
 		}
 
+		if (fromMillis >= 0) {
+			out.write("reset refs/heads/master\nfrom HEAD\n".getBytes());
+			for (final Iterator<Revision> iter = toDownload.iterator();
+					iter.hasNext(); ) {
+				final Revision revision = iter.next();
+				if (revision.getModifiedDate().getValue() <= fromMillis) iter.remove();
+			}
+		} else if (fromRevisionId != null) {
+			System.err.println("Revision " + fromRevisionId + " was not found!");
+			System.exit(1);
+		}
+
 		int mark = 1;
 		for (final Revision revision : toDownload) {
-			if (revision.getModifiedDate().getValue() <= fromMillis) continue;
-
 			System.err.println("Downloading revision " + revision.getId() + " (" + mark + "/" + toDownload.size() + ")");
 			get = drive.files().get(gdocId);
 			final MediaHttpDownloader downloader = get.getMediaHttpDownloader();
