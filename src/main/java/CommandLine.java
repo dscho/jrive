@@ -288,6 +288,7 @@ public class CommandLine {
 		final String[] commandLine = new String[args.length + 1];
 		commandLine[0] = "git";
 		System.arraycopy(args, 0, commandLine, 1, args.length);
-		return ProcessUtils.exec(null, System.err, null, commandLine);
+		final String result = ProcessUtils.exec(null, System.err, null, commandLine);
+		return result.endsWith("\n") ? result.substring(0, result.length() - 1) : result;
 	}
 }
